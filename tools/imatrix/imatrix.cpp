@@ -18,6 +18,8 @@
 #include <map>
 #include <regex>
 #include <numeric>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -30,6 +32,10 @@ static void print_usage(int, char ** argv) {
             "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
             "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
             "       [--show-statistics] [...]\n" , argv[0]);
+    LOG("\n");
+    LOG("  Image embedding support:\n");
+    LOG("    --image-embd FILE       Load pre-computed image embeddings from .embd file\n");
+    LOG("    --image-embd-dir DIR    Load all .embd files from directory\n");
     LOG("\n");
 }
 
@@ -55,6 +61,119 @@ struct tensor_statistics {
     float entropy      = 0.0f;
     float zd           = 0.0f;
     float cossim       = 0.0f;
+};
+
+// Image embedding file format (must match qwen3vl-preprocess.cpp)
+struct img_embd_file_header {
+    char magic[4];      // "IMGE" (IMaGe Embedding)
+    int32_t version;    // Format version (1)
+    int32_t n_tokens;   // Number of image tokens
+    int32_t n_embd;     // Embedding dimension
+    int32_t nx;         // Grid width (for M-RoPE)
+    int32_t ny;         // Grid height (for M-RoPE)
+    int32_t n_pos;      // Number of positions for M-RoPE (max of temporal, height, width)
+    int32_t reserved;   // Reserved for future use
+};
+
+// Loaded image embedding data
+struct image_embedding {
+    std::string filename;
+    img_embd_file_header header;
+    std::vector<float> embeddings;
+};
+
+// Helper struct for managing embedding batches with M-RoPE support
+// Adapted from qwen3vl-inference.cpp
+struct embd_batch {
+    int n_pos_per_embd;
+    int n_embd_dim;
+    std::vector<llama_pos> pos;
+    std::vector<llama_pos> pos_view;
+    std::vector<int32_t> n_seq_id;
+    std::vector<llama_seq_id> seq_id_0;
+    std::vector<llama_seq_id *> seq_ids;
+    std::vector<int8_t> logits;
+    llama_batch batch;
+
+    embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_embd_dim)
+        : n_pos_per_embd(n_pos_per_embd), n_embd_dim(n_embd_dim) {
+        pos.resize(n_tokens * n_pos_per_embd);
+        n_seq_id.resize(n_tokens);
+        seq_ids.resize(n_tokens + 1);
+        logits.resize(n_tokens);
+        seq_id_0.resize(1);
+        seq_ids[n_tokens] = nullptr;
+
+        batch = {
+            /*n_tokens   =*/ n_tokens,
+            /*tokens     =*/ nullptr,
+            /*embd       =*/ embd,
+            /*pos        =*/ pos.data(),
+            /*n_seq_id   =*/ n_seq_id.data(),
+            /*seq_id     =*/ seq_ids.data(),
+            /*logits     =*/ logits.data(),
+        };
+    }
+
+    // Set up M-RoPE 2D positions for image grid
+    void set_position_mrope_2d(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
+        seq_id_0[0] = seq_id;
+        for (int y = 0; y < ny; y++) {
+            for (int x = 0; x < nx; x++) {
+                int i = y * nx + x;
+                pos[i]                      = pos_0;     // temporal
+                pos[i + batch.n_tokens]     = pos_0 + y; // height
+                pos[i + batch.n_tokens * 2] = pos_0 + x; // width
+                pos[i + batch.n_tokens * 3] = 0;         // unused
+            }
+        }
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i] = seq_id_0.data();
+            batch.logits[i] = false;
+        }
+    }
+
+    // Set normal (non-M-RoPE) positions
+    void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
+        seq_id_0[0] = seq_id;
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.pos[i] = pos_0 + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i] = seq_id_0.data();
+            batch.logits[i] = false;
+        }
+    }
+
+    // Get a view of a subset of the batch for chunked processing
+    llama_batch get_view(int offset, int n_tokens_view) {
+        llama_pos * pos_ptr;
+        pos_view.clear();
+
+        if (n_pos_per_embd > 1) {
+            // M-RoPE: positions are stored in planar format
+            pos_view.reserve(n_tokens_view * n_pos_per_embd);
+            for (int d = 0; d < n_pos_per_embd; d++) {
+                size_t src_idx = d * batch.n_tokens + offset;
+                pos_view.insert(pos_view.end(),
+                    pos.data() + src_idx,
+                    pos.data() + src_idx + n_tokens_view);
+            }
+            pos_ptr = pos_view.data();
+        } else {
+            pos_ptr = pos.data() + offset;
+        }
+
+        return {
+            /*n_tokens   =*/ n_tokens_view,
+            /*tokens     =*/ nullptr,
+            /*embd       =*/ batch.embd + offset * n_embd_dim,
+            /*pos        =*/ pos_ptr,
+            /*n_seq_id   =*/ batch.n_seq_id + offset,
+            /*seq_id     =*/ batch.seq_id + offset,
+            /*logits     =*/ batch.logits + offset,
+        };
+    }
 };
 
 class IMatrixCollector {
@@ -94,6 +213,71 @@ static std::string filter_tensor_name(const char * name) {
         wname = name;
     }
     return wname;
+}
+
+// Load a single .embd file
+static bool load_image_embedding(const std::string & path, image_embedding & img_embd) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        LOG_ERR("%s: failed to open embeddings file '%s'\n", __func__, path.c_str());
+        return false;
+    }
+
+    in.read(reinterpret_cast<char*>(&img_embd.header), sizeof(img_embd.header));
+    if (!in.good()) {
+        LOG_ERR("%s: failed to read header from '%s'\n", __func__, path.c_str());
+        return false;
+    }
+
+    if (strncmp(img_embd.header.magic, "IMGE", 4) != 0) {
+        LOG_ERR("%s: invalid magic in '%s' (expected 'IMGE')\n", __func__, path.c_str());
+        return false;
+    }
+
+    if (img_embd.header.version != 1) {
+        LOG_ERR("%s: unsupported version %d in '%s'\n", __func__, img_embd.header.version, path.c_str());
+        return false;
+    }
+
+    size_t expected_size = (size_t)img_embd.header.n_tokens * img_embd.header.n_embd;
+    img_embd.embeddings.resize(expected_size);
+
+    in.read(reinterpret_cast<char*>(img_embd.embeddings.data()), expected_size * sizeof(float));
+    if (!in.good()) {
+        LOG_ERR("%s: failed to read embeddings from '%s'\n", __func__, path.c_str());
+        return false;
+    }
+
+    img_embd.filename = path;
+    return true;
+}
+
+// Load all .embd files from a directory
+static bool load_image_embeddings_from_dir(const std::string & dir_path, std::vector<image_embedding> & embeddings) {
+    DIR * dir = opendir(dir_path.c_str());
+    if (!dir) {
+        LOG_ERR("%s: failed to open directory '%s'\n", __func__, dir_path.c_str());
+        return false;
+    }
+
+    struct dirent * entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string filename = entry->d_name;
+        if (filename.size() < 5 || filename.substr(filename.size() - 5) != ".embd") {
+            continue;
+        }
+
+        std::string full_path = dir_path + "/" + filename;
+        image_embedding img_embd;
+        if (load_image_embedding(full_path, img_embd)) {
+            embeddings.push_back(std::move(img_embd));
+            LOG_INF("%s: loaded %s (%d tokens, %dx%d grid)\n", __func__,
+                    filename.c_str(), img_embd.header.n_tokens, img_embd.header.nx, img_embd.header.ny);
+        }
+    }
+
+    closedir(dir);
+    return !embeddings.empty();
 }
 
 static void process_tensor_name(const std::string & input, std::string & layer, std::string & tensor) {
@@ -906,7 +1090,8 @@ static void process_logits(
     }
 }
 
-static bool compute_imatrix(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
+static bool compute_imatrix(llama_context * ctx, const common_params & params, const int32_t n_ctx,
+                            const std::vector<image_embedding> & image_embeddings = {}) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -914,10 +1099,19 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
-    auto tim1 = std::chrono::high_resolution_clock::now();
-    LOG_INF("%s: tokenizing the input ..\n", __func__);
+    // Count total image tokens
+    int64_t total_image_tokens = 0;
+    for (const auto & img_embd : image_embeddings) {
+        total_image_tokens += img_embd.header.n_tokens;
+    }
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
+    auto tim1 = std::chrono::high_resolution_clock::now();
+
+    std::vector<llama_token> tokens;
+    if (!params.prompt.empty()) {
+        LOG_INF("%s: tokenizing the input ..\n", __func__);
+        tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
+    }
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -931,7 +1125,13 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
         tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
     }
 
-    if (int(tokens.size()) < 2*n_ctx) {
+    // For image-only mode, we don't need text tokens
+    if (tokens.empty() && image_embeddings.empty()) {
+        LOG_ERR("%s: no input provided (need either text or image embeddings)\n", __func__);
+        return false;
+    }
+
+    if (!tokens.empty() && int(tokens.size()) < 2*n_ctx) {
         LOG_ERR("%s: you need at least %d tokens for a context of %d tokens\n", __func__, 2*n_ctx, n_ctx);
         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n", __func__, tokens.size());
         return false;
@@ -969,6 +1169,106 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     }
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
+
+    // Process image embeddings first (if any)
+    if (!image_embeddings.empty()) {
+        LOG_INF("%s: processing %zu image embedding(s) with %lld total tokens\n",
+                __func__, image_embeddings.size(), (long long)total_image_tokens);
+
+        const int model_n_embd_inp = llama_model_n_embd_inp(model);
+
+        for (size_t img_idx = 0; img_idx < image_embeddings.size(); img_idx++) {
+            const auto & img_embd = image_embeddings[img_idx];
+            auto header = img_embd.header;
+            std::vector<float> embeddings = img_embd.embeddings;
+
+            LOG_INF("%s: [%zu/%zu] processing %s (%d tokens, grid=%dx%d)\n",
+                    __func__, img_idx + 1, image_embeddings.size(),
+                    img_embd.filename.c_str(), header.n_tokens, header.nx, header.ny);
+
+            // Handle pixel shuffle for Qwen3-VL deep stack layers
+            if (model_n_embd_inp == header.n_embd * 4) {
+                LOG_INF("%s:   applying 2x2 patch merging for deep stack layers\n", __func__);
+
+                int new_nx = header.nx / 2;
+                int new_ny = header.ny / 2;
+                int new_n_embd = header.n_embd * 4;
+                std::vector<float> merged(new_nx * new_ny * new_n_embd);
+
+                for (int y = 0; y < new_ny; y++) {
+                    for (int x = 0; x < new_nx; x++) {
+                        int src_x = x * 2;
+                        int src_y = y * 2;
+                        int dst_idx = (y * new_nx + x) * new_n_embd;
+                        int src_tl = (src_y * header.nx + src_x) * header.n_embd;
+                        int src_tr = (src_y * header.nx + (src_x + 1)) * header.n_embd;
+                        int src_bl = ((src_y + 1) * header.nx + src_x) * header.n_embd;
+                        int src_br = ((src_y + 1) * header.nx + (src_x + 1)) * header.n_embd;
+
+                        memcpy(merged.data() + dst_idx, embeddings.data() + src_tl, header.n_embd * sizeof(float));
+                        memcpy(merged.data() + dst_idx + header.n_embd, embeddings.data() + src_tr, header.n_embd * sizeof(float));
+                        memcpy(merged.data() + dst_idx + header.n_embd * 2, embeddings.data() + src_bl, header.n_embd * sizeof(float));
+                        memcpy(merged.data() + dst_idx + header.n_embd * 3, embeddings.data() + src_br, header.n_embd * sizeof(float));
+                    }
+                }
+
+                header.nx = new_nx;
+                header.ny = new_ny;
+                header.n_embd = new_n_embd;
+                header.n_tokens = new_nx * new_ny;
+                embeddings = std::move(merged);
+
+                LOG_INF("%s:   merged to %d tokens (grid=%dx%d, dim=%d)\n",
+                        __func__, header.n_tokens, header.nx, header.ny, header.n_embd);
+            } else if (header.n_embd != model_n_embd_inp) {
+                LOG_ERR("%s: embedding dimension mismatch (file: %d, model expects: %d)\n",
+                        __func__, header.n_embd, model_n_embd_inp);
+                return false;
+            }
+
+            // Clear the KV cache before processing this image
+            llama_memory_clear(llama_get_memory(ctx), true);
+
+            // Determine if we need M-RoPE (4 position dimensions) or standard positions
+            bool use_mrope = (header.nx > 0 && header.ny > 0);
+            int n_pos_per_embd = use_mrope ? 4 : 1;
+
+            embd_batch img_batch(embeddings.data(), header.n_tokens, n_pos_per_embd, header.n_embd);
+
+            if (use_mrope) {
+                img_batch.set_position_mrope_2d(0, header.nx, header.ny, 0);
+                // For non-causal attention during image processing
+                llama_set_causal_attn(ctx, false);
+            } else {
+                img_batch.set_position_normal(0, 0);
+            }
+
+            // Process image embeddings in batches
+            int n_img_tokens = header.n_tokens;
+            for (int offset = 0; offset < n_img_tokens; ) {
+                int chunk_size = std::min(n_batch, n_img_tokens - offset);
+                llama_batch view = img_batch.get_view(offset, chunk_size);
+
+                if (llama_decode(ctx, view) != 0) {
+                    LOG_ERR("%s: failed to decode image embeddings at offset %d\n", __func__, offset);
+                    if (use_mrope) {
+                        llama_set_causal_attn(ctx, true);
+                    }
+                    return false;
+                }
+
+                offset += chunk_size;
+            }
+
+            if (use_mrope) {
+                llama_set_causal_attn(ctx, true);
+            }
+
+            LOG_INF("%s:   decoded %d image tokens\n", __func__, n_img_tokens);
+        }
+
+        LOG_INF("%s: completed processing all image embeddings\n", __func__);
+    }
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
@@ -1196,6 +1496,19 @@ int main(int argc, char ** argv) {
     params.n_ctx = 512;
     params.escape = false;
 
+    // Parse image embedding options before common_params_parse
+    std::vector<std::string> image_embd_files;
+    std::string image_embd_dir;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--image-embd" && i + 1 < argc) {
+            image_embd_files.push_back(argv[++i]);
+        } else if (arg == "--image-embd-dir" && i + 1 < argc) {
+            image_embd_dir = argv[++i];
+        }
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
         return 1;
     }
@@ -1226,6 +1539,33 @@ int main(int argc, char ** argv) {
         params.n_batch = std::min(params.n_batch, n_kv);
     }
 
+    // Load image embeddings
+    std::vector<image_embedding> image_embeddings;
+
+    // Load from directory if specified
+    if (!image_embd_dir.empty()) {
+        LOG_INF("%s : loading image embeddings from directory '%s'\n", __func__, image_embd_dir.c_str());
+        if (!load_image_embeddings_from_dir(image_embd_dir, image_embeddings)) {
+            LOG_ERR("%s : failed to load embeddings from directory '%s'\n", __func__, image_embd_dir.c_str());
+            return 1;
+        }
+    }
+
+    // Load individual files if specified
+    for (const auto & embd_file : image_embd_files) {
+        LOG_INF("%s : loading image embedding from '%s'\n", __func__, embd_file.c_str());
+        image_embedding img_embd;
+        if (!load_image_embedding(embd_file, img_embd)) {
+            LOG_ERR("%s : failed to load %s\n", __func__, embd_file.c_str());
+            return 1;
+        }
+        image_embeddings.push_back(std::move(img_embd));
+    }
+
+    if (!image_embeddings.empty()) {
+        LOG_INF("%s : loaded %zu image embedding(s)\n", __func__, image_embeddings.size());
+    }
+
     g_collector.set_params(params);
 
     for (const auto & in_file : params.in_files) {
@@ -1236,11 +1576,11 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (params.prompt.empty()) {
-        LOG_INF("No prompt provided; combining precomputed matrices only.\n");
+    if (params.prompt.empty() && image_embeddings.empty()) {
+        LOG_INF("No prompt or image embeddings provided; combining precomputed matrices only.\n");
 
         if (params.in_files.empty()) {
-            LOG_ERR("Error: No prompt provided and no precomputed matrices (--in-file) to combine.\n");
+            LOG_ERR("Error: No prompt/images provided and no precomputed matrices (--in-file) to combine.\n");
             return 1;
         }
 
@@ -1287,7 +1627,7 @@ int main(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
-    if (!compute_imatrix(ctx, params, n_ctx)) {
+    if (!compute_imatrix(ctx, params, n_ctx, image_embeddings)) {
         return 1;
     }
 
