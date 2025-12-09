@@ -1536,20 +1536,29 @@ int main(int argc, char ** argv) {
     params.n_ctx = 512;
     params.escape = false;
 
-    // Parse image embedding options before common_params_parse
+    // Parse image embedding options and filter them out before common_params_parse
     std::vector<std::string> image_embd_files;
     std::string image_embd_dir;
+
+    std::vector<char*> filtered_argv;
+    filtered_argv.push_back(argv[0]); // Keep program name
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--image-embd" && i + 1 < argc) {
             image_embd_files.push_back(argv[++i]);
+            // Skip both --image-embd and its argument
         } else if (arg == "--image-embd-dir" && i + 1 < argc) {
             image_embd_dir = argv[++i];
+            // Skip both --image-embd-dir and its argument
+        } else {
+            filtered_argv.push_back(argv[i]);
         }
     }
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
+    int filtered_argc = filtered_argv.size();
+
+    if (!common_params_parse(filtered_argc, filtered_argv.data(), params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
         return 1;
     }
 
