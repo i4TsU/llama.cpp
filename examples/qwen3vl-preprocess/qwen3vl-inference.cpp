@@ -1,3 +1,16 @@
+/**
+ * qwen3vl-inference: Run inference with pre-computed image embeddings
+ *
+ * This tool loads pre-computed image embeddings and runs inference using
+ * only the language model (no mmproj required). This allows running the
+ * expensive vision encoding once and reusing the embeddings.
+ *
+ * Usage:
+ *   qwen3vl-inference -m model.gguf -p "Describe this image"
+ *
+ * The embeddings file (image.embd) must be in the current directory.
+ */
+
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
@@ -7,342 +20,423 @@
 #include <vector>
 #include <string>
 #include <fstream>
-#include <cmath>
 #include <algorithm>
 
+// Must match the header in qwen3vl-preprocess.cpp
 struct img_embd_file_header {
-    char magic[4];     // "Q3VL"
-    int32_t version;   // 1
-    int32_t n_tokens;
-    int32_t n_embd;
-    int32_t nx;
-    int32_t ny;
+    char magic[4];      // "IMGE"
+    int32_t version;    // 1
+    int32_t n_tokens;   // Number of image tokens
+    int32_t n_embd;     // Embedding dimension
+    int32_t nx;         // Grid width (for M-RoPE)
+    int32_t ny;         // Grid height (for M-RoPE)
+    int32_t n_pos;      // Number of positions for M-RoPE
+    int32_t reserved;   // Reserved
+};
+
+// Helper struct for managing embedding batches with M-RoPE support
+// Adapted from mtmd-helper.cpp's decode_embd_batch
+struct embd_batch {
+    int n_pos_per_embd;
+    int n_embd_dim;
+    std::vector<llama_pos> pos;
+    std::vector<llama_pos> pos_view;
+    std::vector<int32_t> n_seq_id;
+    std::vector<llama_seq_id> seq_id_0;
+    std::vector<llama_seq_id *> seq_ids;
+    std::vector<int8_t> logits;
+    llama_batch batch;
+
+    embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_embd_dim)
+        : n_pos_per_embd(n_pos_per_embd), n_embd_dim(n_embd_dim) {
+        pos.resize(n_tokens * n_pos_per_embd);
+        n_seq_id.resize(n_tokens);
+        seq_ids.resize(n_tokens + 1);
+        logits.resize(n_tokens);
+        seq_id_0.resize(1);
+        seq_ids[n_tokens] = nullptr;
+
+        batch = {
+            /*n_tokens   =*/ n_tokens,
+            /*tokens     =*/ nullptr,
+            /*embd       =*/ embd,
+            /*pos        =*/ pos.data(),
+            /*n_seq_id   =*/ n_seq_id.data(),
+            /*seq_id     =*/ seq_ids.data(),
+            /*logits     =*/ logits.data(),
+        };
+    }
+
+    // Set up M-RoPE 2D positions for image grid
+    void set_position_mrope_2d(llama_pos pos_0, int nx, int ny, llama_seq_id seq_id) {
+        seq_id_0[0] = seq_id;
+        for (int y = 0; y < ny; y++) {
+            for (int x = 0; x < nx; x++) {
+                int i = y * nx + x;
+                pos[i]                      = pos_0;     // temporal
+                pos[i + batch.n_tokens]     = pos_0 + y; // height
+                pos[i + batch.n_tokens * 2] = pos_0 + x; // width
+                pos[i + batch.n_tokens * 3] = 0;         // unused
+            }
+        }
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i] = seq_id_0.data();
+            batch.logits[i] = false;
+        }
+    }
+
+    // Set normal (non-M-RoPE) positions
+    void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
+        seq_id_0[0] = seq_id;
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.pos[i] = pos_0 + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i] = seq_id_0.data();
+            batch.logits[i] = false;
+        }
+    }
+
+    // Get a view of a subset of the batch for chunked processing
+    llama_batch get_view(int offset, int n_tokens_view) {
+        llama_pos * pos_ptr;
+        pos_view.clear();
+
+        if (n_pos_per_embd > 1) {
+            // M-RoPE: positions are stored in planar format
+            pos_view.reserve(n_tokens_view * n_pos_per_embd);
+            for (int d = 0; d < n_pos_per_embd; d++) {
+                size_t src_idx = d * batch.n_tokens + offset;
+                pos_view.insert(pos_view.end(),
+                    pos.data() + src_idx,
+                    pos.data() + src_idx + n_tokens_view);
+            }
+            pos_ptr = pos_view.data();
+        } else {
+            pos_ptr = pos.data() + offset;
+        }
+
+        return {
+            /*n_tokens   =*/ n_tokens_view,
+            /*tokens     =*/ nullptr,
+            /*embd       =*/ batch.embd + offset * n_embd_dim,
+            /*pos        =*/ pos_ptr,
+            /*n_seq_id   =*/ batch.n_seq_id + offset,
+            /*seq_id     =*/ batch.seq_id + offset,
+            /*logits     =*/ batch.logits + offset,
+        };
+    }
 };
 
 static void print_usage(int argc, char ** argv) {
-    fprintf(stderr, "usage: %s [options]\n", argv[0]);
-    fprintf(stderr, "Check qwen3vl-inference.cpp for options\n");
+    fprintf(stderr, "\nUsage: %s -m MODEL [options]\n\n", argv[0]);
+    fprintf(stderr, "Run inference with pre-computed image embeddings.\n\n");
+    fprintf(stderr, "Required:\n");
+    fprintf(stderr, "  -m,  --model FILE      Path to the language model\n");
+    fprintf(stderr, "\nCommon options:\n");
+    fprintf(stderr, "  -p,  --prompt TEXT     Prompt (default: 'Describe this image.')\n");
+    fprintf(stderr, "  -n,  --predict N       Tokens to generate (default: 512)\n");
+    fprintf(stderr, "  -e,  --embd FILE       Embeddings file (default: 'image.embd')\n");
+    fprintf(stderr, "  -ngl N                 GPU layers to offload\n");
+    fprintf(stderr, "  -c N                   Context size\n");
+    fprintf(stderr, "\n");
+}
+
+static bool load_embeddings(const std::string & path, img_embd_file_header & header,
+                            std::vector<float> & embeddings) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        fprintf(stderr, "error: failed to open embeddings file '%s'\n", path.c_str());
+        return false;
+    }
+
+    in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!in.good()) {
+        fprintf(stderr, "error: failed to read header from '%s'\n", path.c_str());
+        return false;
+    }
+
+    if (strncmp(header.magic, "IMGE", 4) != 0) {
+        fprintf(stderr, "error: invalid magic in '%s' (expected 'IMGE')\n", path.c_str());
+        return false;
+    }
+
+    if (header.version != 1) {
+        fprintf(stderr, "error: unsupported version %d in '%s'\n", header.version, path.c_str());
+        return false;
+    }
+
+    size_t expected_size = (size_t)header.n_tokens * header.n_embd;
+    embeddings.resize(expected_size);
+
+    in.read(reinterpret_cast<char*>(embeddings.data()), expected_size * sizeof(float));
+    if (!in.good()) {
+        fprintf(stderr, "error: failed to read embeddings from '%s'\n", path.c_str());
+        return false;
+    }
+
+    return true;
 }
 
 int main(int argc, char ** argv) {
     common_params params;
-    // Set some defaults
-    params.n_gpu_layers = 999;
-    params.n_ubatch = 2048; // Ensure ubatch is large enough for image tokens
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; // Force disable for verification
-    
+    params.n_predict = 512;
+
+    std::string embd_file = "image.embd";
+
+    // Parse -e/--embd before common_params_parse (which doesn't know about it)
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if ((arg == "-e" || arg == "--embd") && i + 1 < argc) {
+            embd_file = argv[++i];
+        }
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
         return 1;
     }
-    
+
     if (params.model.path.empty()) {
         fprintf(stderr, "error: --model is required\n");
+        print_usage(argc, argv);
         return 1;
+    }
+
+    if (params.prompt.empty()) {
+        params.prompt = "Describe this image.";
     }
 
     // Initialize backend
     llama_backend_init();
-    
-    // Load Model (LLM ONLY - No mmproj loaded!)
+
+    // Load the language model
+    fprintf(stderr, "Loading language model...\n");
     common_init_result llama_init = common_init_from_params(params);
-    
-    // Access unique_ptrs
+
     llama_model * model = llama_init.model.get();
     llama_context * ctx = llama_init.context.get();
-    
-    if (model == NULL || ctx == NULL) {
-        fprintf(stderr, "%s: error: failed to load model/context\n", __func__);
+
+    if (!model || !ctx) {
+        fprintf(stderr, "error: failed to load model or create context\n");
+        llama_backend_free();
         return 1;
     }
-    
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    int n_batch = llama_n_batch(ctx);
 
-    // Initialize Sampler
-    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.8f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    // Load Image Embeddings
-    std::string img_file = "image.img_embd"; // Fixed name for now matching preprocess
-    std::ifstream in(img_file, std::ios::binary);
-    if (!in) {
-        fprintf(stderr, "error: failed to open '%s'\n", img_file.c_str());
-        return 1;
-    }
-    
+    // Load pre-computed embeddings
+    fprintf(stderr, "Loading embeddings from '%s'...\n", embd_file.c_str());
     img_embd_file_header header;
-    in.read((char*)&header, sizeof(header));
-    
-    if (strncmp(header.magic, "Q3VL", 4) != 0) {
-        fprintf(stderr, "error: invalid magic in '%s'\n", img_file.c_str());
+    std::vector<float> embeddings;
+
+    if (!load_embeddings(embd_file, header, embeddings)) {
+        llama_backend_free();
         return 1;
     }
-    
-    std::vector<float> embeddings(header.n_tokens * header.n_embd);
-    in.read((char*)embeddings.data(), embeddings.size() * sizeof(float));
-    in.close();
-    
-    fprintf(stderr, "Loaded %d image tokens (nx=%d, ny=%d)\n", header.n_tokens, header.nx, header.ny);
-    fprintf(stderr, "header.n_embd: %d\n", header.n_embd);
-    fprintf(stderr, "model n_embd_inp: %d\n", llama_model_n_embd_inp(model));
-    
-    if (llama_model_n_embd_inp(model) == header.n_embd * 4) {
-        fprintf(stderr, "Applying 2x2 patch merging (Pixel Shuffle)...\n");
+
+    fprintf(stderr, "Loaded %d image tokens (grid=%dx%d, dim=%d, n_pos=%d)\n",
+            header.n_tokens, header.nx, header.ny, header.n_embd, header.n_pos);
+
+    // Check embedding dimensions - Qwen3-VL uses deep stack layers where n_embd_inp = n_embd * 4
+    int model_n_embd_inp = llama_model_n_embd_inp(model);
+
+    if (model_n_embd_inp == header.n_embd * 4) {
+        // Apply 2x2 patch merging (pixel shuffle) for Qwen3-VL deep stack
+        fprintf(stderr, "Applying 2x2 patch merging for deep stack layers...\n");
+
         int new_nx = header.nx / 2;
         int new_ny = header.ny / 2;
         int new_n_embd = header.n_embd * 4;
-        std::vector<float> merged_embeddings(new_nx * new_ny * new_n_embd);
+        std::vector<float> merged(new_nx * new_ny * new_n_embd);
 
         for (int y = 0; y < new_ny; y++) {
             for (int x = 0; x < new_nx; x++) {
                 int src_x = x * 2;
                 int src_y = y * 2;
-                
-                // Destination index for the merged token
+
                 int dst_idx = (y * new_nx + x) * new_n_embd;
-                
-                // Source indices for 2x2 block
-                int src_idx_tl = (src_y * header.nx + src_x) * header.n_embd;                 // Top-Left
-                int src_idx_tr = (src_y * header.nx + (src_x + 1)) * header.n_embd;           // Top-Right
-                int src_idx_bl = ((src_y + 1) * header.nx + src_x) * header.n_embd;           // Bottom-Left
-                int src_idx_br = ((src_y + 1) * header.nx + (src_x + 1)) * header.n_embd;     // Bottom-Right
-                
-                // Copy data: TL, TR, BL, BR
-                memcpy(merged_embeddings.data() + dst_idx, 
-                       embeddings.data() + src_idx_tl, header.n_embd * sizeof(float));
-                memcpy(merged_embeddings.data() + dst_idx + header.n_embd, 
-                       embeddings.data() + src_idx_tr, header.n_embd * sizeof(float));
-                memcpy(merged_embeddings.data() + dst_idx + header.n_embd * 2, 
-                       embeddings.data() + src_idx_bl, header.n_embd * sizeof(float));
-                memcpy(merged_embeddings.data() + dst_idx + header.n_embd * 3, 
-                       embeddings.data() + src_idx_br, header.n_embd * sizeof(float));
+
+                // Source indices for 2x2 block (TL, TR, BL, BR)
+                int src_tl = (src_y * header.nx + src_x) * header.n_embd;
+                int src_tr = (src_y * header.nx + (src_x + 1)) * header.n_embd;
+                int src_bl = ((src_y + 1) * header.nx + src_x) * header.n_embd;
+                int src_br = ((src_y + 1) * header.nx + (src_x + 1)) * header.n_embd;
+
+                // Concatenate: TL, TR, BL, BR
+                memcpy(merged.data() + dst_idx, embeddings.data() + src_tl, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd, embeddings.data() + src_tr, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd * 2, embeddings.data() + src_bl, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd * 3, embeddings.data() + src_br, header.n_embd * sizeof(float));
             }
         }
-        
-        // Update header info and embeddings
+
         header.nx = new_nx;
         header.ny = new_ny;
         header.n_embd = new_n_embd;
         header.n_tokens = new_nx * new_ny;
-        embeddings = std::move(merged_embeddings);
-        fprintf(stderr, "Merged: %d tokens (nx=%d, ny=%d, dim=%d)\n", header.n_tokens, header.nx, header.ny, header.n_embd);
-    } else if (header.n_embd != llama_model_n_embd_inp(model)) {
-        fprintf(stderr, "error: Embedding dimension mismatch! File: %d, Model: %d. No automatic fix available.\n", header.n_embd, llama_model_n_embd_inp(model));
+        embeddings = std::move(merged);
+
+        fprintf(stderr, "Merged to %d tokens (grid=%dx%d, dim=%d)\n",
+                header.n_tokens, header.nx, header.ny, header.n_embd);
+    } else if (header.n_embd != model_n_embd_inp) {
+        fprintf(stderr, "error: embedding dimension mismatch (file: %d, model expects: %d)\n",
+                header.n_embd, model_n_embd_inp);
+        llama_backend_free();
         return 1;
     }
 
-    // Prepare Batch
-    llama_batch batch = llama_batch_init(8192, 0, 1); // Ensure enough capacity
+    // Initialize sampler
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    // Helper to decode text
-    auto decode_text = [&](const std::string & text, int32_t & pos) {
-        std::vector<llama_token> toks = common_tokenize(ctx, text, false, true);
-        if (toks.empty()) return;
-        
-        batch.n_tokens = toks.size();
-        for (size_t i = 0; i < toks.size(); i++) {
-            batch.token[i] = toks[i];
-            batch.pos[i] = pos + (int32_t)i;
-            batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0; 
-            batch.logits[i] = (i == toks.size() - 1); // Enable logits for the last token
+    // Create batch for text tokens
+    llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
+
+    // Helper to decode text tokens
+    auto decode_text = [&](const std::string & text, llama_pos & pos, bool logits_last) -> bool {
+        std::vector<llama_token> tokens = common_tokenize(ctx, text, false, true);
+        if (tokens.empty()) return true;
+
+        for (size_t i = 0; i < tokens.size(); ) {
+            text_batch.n_tokens = 0;
+
+            for (; i < tokens.size() && text_batch.n_tokens < n_batch; i++) {
+                int j = text_batch.n_tokens;
+                text_batch.token[j] = tokens[i];
+                text_batch.pos[j] = pos++;
+                text_batch.n_seq_id[j] = 1;
+                text_batch.seq_id[j][0] = 0;
+                text_batch.logits[j] = (logits_last && i == tokens.size() - 1);
+                text_batch.n_tokens++;
+            }
+
+            if (llama_decode(ctx, text_batch) != 0) {
+                fprintf(stderr, "error: failed to decode text\n");
+                return false;
+            }
         }
-        batch.embd = nullptr;
-        if (llama_decode(ctx, batch) != 0) {
-            fprintf(stderr, "failed to decode text: %s\n", text.c_str());
-            exit(1);
-        }
-        pos += (int32_t)toks.size();
+        return true;
     };
 
-    // Construct M-RoPE Positions
-    int32_t n_past = 0; 
-    
-    // 1. Decode "<|vision_start|>"
-    decode_text("<|vision_start|>", n_past);
+    llama_pos n_past = 0;
 
-    // 2. Decode Image Embeddings with M-RoPE
-    int32_t n_total = header.n_tokens;
-    // For non-causal attention, we must not exceed n_ubatch per call
-    int32_t n_batch_size = 512; // default safe
-    if (llama_n_ubatch(ctx) > 0) {
-        n_batch_size = llama_n_ubatch(ctx);
-    }
-    
-    // Allocate M-RoPE positions (4 dimensions per token)
-    std::vector<llama_pos> mrope_pos(n_total * 4);
-    
-    int32_t base_pos = n_past; // The temporal position for the image
-    
-    for (int y = 0; y < header.ny; y++) {
-        for (int x = 0; x < header.nx; x++) {
-            long long i = (long long)y * header.nx + x;
-            if (i >= n_total) break; 
-            
-            mrope_pos[i]               = base_pos;     // dim 0: time
-            mrope_pos[i + n_total]     = base_pos + y; // dim 1: height
-            mrope_pos[i + n_total * 2] = base_pos + x; // dim 2: width
-            mrope_pos[i + n_total * 3] = 0;            // dim 3: unused
-        }
-    }
-    
-    llama_set_causal_attn(ctx, false);
-    
-    // Save original batch pointers to restore later
-    llama_token * original_token = batch.token;
-    llama_pos   * original_pos   = batch.pos;
+    // Build the full prompt with proper chat template structure
+    // For Qwen3-VL the format is:
+    // <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+    // <|im_start|>user\n<|vision_start|>[IMAGE]<|vision_end|>PROMPT<|im_end|>\n
+    // <|im_start|>assistant\n
 
-    int32_t offset = 0;
-    while (offset < n_total) {
-        int32_t chunk_size = std::min(n_batch_size, n_total - offset);
-        
-        batch.n_tokens = chunk_size;
-        batch.embd = embeddings.data() + (offset * header.n_embd);
-        batch.token = nullptr;
-        
-        // Construct Pos View
-        static std::vector<llama_pos> pos_view;
-        pos_view.clear();
-        pos_view.reserve(chunk_size * 4);
-        
-        for (int d = 0; d < 4; d++) {
-             for (int i = 0; i < chunk_size; i++) {
-                 // mrope_pos is PLANAR: [Time 0..N, Height 0..N, Width 0..N, Unused 0..N]
-                 // We want Dim d for token 'offset + i'.
-                 // Index = d * n_total + (offset + i);
-                 int32_t dim_index = d * n_total + (offset + i);
-                 pos_view.push_back(mrope_pos[dim_index]);
-             }
-        }
-        batch.pos = pos_view.data(); // Override pos pointer
-        
-        for (int i = 0; i < chunk_size; i++) {
-            batch.n_seq_id[i] = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i] = false; 
-        }
-        
-        if (batch.embd == nullptr || batch.pos == nullptr || pos_view.empty()) {
-            fprintf(stderr, "error: invalid batch pointers or empty pos_view\n");
+    fprintf(stderr, "Processing prompt...\n");
+
+    // 1. System prompt
+    std::string system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
+    if (!decode_text(system_prompt, n_past, false)) {
+        llama_sampler_free(smpl);
+        llama_batch_free(text_batch);
+        llama_backend_free();
+        return 1;
+    }
+
+    // 2. User turn start with vision_start token
+    std::string user_start = "<|im_start|>user\n<|vision_start|>";
+    if (!decode_text(user_start, n_past, false)) {
+        llama_sampler_free(smpl);
+        llama_batch_free(text_batch);
+        llama_backend_free();
+        return 1;
+    }
+
+    // 3. Decode image embeddings with M-RoPE
+    fprintf(stderr, "Decoding %d image tokens...\n", header.n_tokens);
+
+    // Determine if we need M-RoPE (4 position dimensions) or standard positions
+    // For Qwen3-VL, we use M-RoPE with 2D positions
+    bool use_mrope = (header.nx > 0 && header.ny > 0);
+    int n_pos_per_embd = use_mrope ? 4 : 1;
+
+    embd_batch img_batch(embeddings.data(), header.n_tokens, n_pos_per_embd, header.n_embd);
+
+    if (use_mrope) {
+        img_batch.set_position_mrope_2d(n_past, header.nx, header.ny, 0);
+        // For non-causal attention during image processing
+        llama_set_causal_attn(ctx, false);
+    } else {
+        img_batch.set_position_normal(n_past, 0);
+    }
+
+    // Process image embeddings in batches
+    int n_img_tokens = header.n_tokens;
+    for (int offset = 0; offset < n_img_tokens; ) {
+        int chunk_size = std::min(n_batch, n_img_tokens - offset);
+        llama_batch view = img_batch.get_view(offset, chunk_size);
+
+        if (llama_decode(ctx, view) != 0) {
+            fprintf(stderr, "error: failed to decode image embeddings at offset %d\n", offset);
+            llama_set_causal_attn(ctx, true);
+            llama_sampler_free(smpl);
+            llama_batch_free(text_batch);
+            llama_backend_free();
             return 1;
         }
-        
-        if (llama_decode(ctx, batch) != 0) {
-            fprintf(stderr, "error: llama_decode failed at offset %d\n", offset);
-            return 1;
-        }
-        
+
         offset += chunk_size;
-        fprintf(stderr, "Processed %d/%d image tokens\n", offset, n_total);
-        fflush(stderr);
+        fprintf(stderr, "  processed %d/%d image tokens\n", offset, n_img_tokens);
     }
-    
-    // Restore original batch pointers
-    batch.token = original_token;
-    batch.pos   = original_pos;
 
-    llama_set_causal_attn(ctx, true);
-    
-    // Increment pos by 1 (M-RoPE logic for Qwen3-VL: image takes 1 temporal unit)
-    n_past += 1;
+    if (use_mrope) {
+        llama_set_causal_attn(ctx, true);
+    }
 
-    // 3. Decode "<|vision_end|>"
-    decode_text("<|vision_end|>", n_past);
-    
-    // 4. Decode Prompt (Chat Template)
-    std::string prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|>";
-    // Image tokens are inserted here conceptually, but we already processed them.
-    // The model expects <|vision_start|>...<|vision_end|> inside the user content.
-    // We already processed <|vision_start|>...image...<|vision_end|>.
-    // So we just need to append the text part of the user message and then start the assistant turn.
-    
-    // Actually, looking at how we processed things:
-    // 1. Loaded image
-    // 2. Decoded "<|vision_start|>" -> image tokens -> "<|vision_end|>"
-    // So we are currently at the state where <|vision_end|> was just processed.
-    
-    // We need to verify where <|vision_start|> was decoded.
-    // In code: 
-    // decode_text("<|vision_start|>", n_past);
-    // process image...
-    // decode_text("<|vision_end|>", n_past);
-    
-    // So we need to prepend the system prompt and the user start tag *before* the vision start?
-    // Or just wrap the "Describe this image" part?
-    
-    // Correct order:
-    // <|im_start|>system...<|im_end|>
-    // <|im_start|>user
-    // <|vision_start|> [IMAGE] <|vision_end|> Describe this image. <|im_end|>
-    // <|im_start|>assistant
-    
-    // We have ALREADY processed <|vision_start|>...<|vision_end|>.
-    // This is awkward. We should have output the system preamble FIRST.
-    // But since that's water under the bridge for the `main` flow structure (unless I change order),
-    // I will try to just add the rest of the user prompt and the assistant start.
-    // BUT the <|vision_start|>...<|vision_end|> block is floating with no <|im_start|>user before it?
-    // That confuses the model.
-    
-    // I MUST move the system prompt and user start to BEFORE the image processing.
-    // But I can't easily jump back in lines with this tool.
-    
-    // Alternative: Just fix the text being decoded NOW.
-    // "Describe this image.<|im_end|>\n<|im_start|>assistant\n"
-    // This assumes the model can tolerate the missing <|im_start|>user and system prompt at the very beginning.
-    // Qwen models are usually sensitive to template.
-    
-    // Let's scroll up and see where vision_start is.
-    // It is at line 168. 
-    
-    // I will modify this specific block to close the user turn and start the assistant turn.
-    // Maybe that's enough to kick it out of "EOS mode".
-    decode_text("Describe this image.<|im_end|>\n<|im_start|>assistant\n", n_past);
-    int n_predict = 512;
+    // Advance position by n_pos (for M-RoPE this is max(t,h,w), otherwise n_tokens)
+    n_past += (header.n_pos > 0) ? header.n_pos : header.n_tokens;
+
+    // 4. Vision end, user prompt, and assistant start
+    std::string user_end = "<|vision_end|>" + params.prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!decode_text(user_end, n_past, true)) {
+        llama_sampler_free(smpl);
+        llama_batch_free(text_batch);
+        llama_backend_free();
+        return 1;
+    }
+
+    // 5. Generate response
+    fprintf(stderr, "Generating response...\n\n");
+
+    int n_predict = params.n_predict;
     for (int i = 0; i < n_predict; i++) {
-        // Sample
-        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-        
-        // Check EOS
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
+        llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
+
+        if (llama_vocab_is_eog(vocab, new_token)) {
             break;
         }
-        
-        // Print
-        std::string piece = common_token_to_piece(ctx, new_token_id);
+
+        std::string piece = common_token_to_piece(ctx, new_token);
         printf("%s", piece.c_str());
         fflush(stdout);
-        
-        // Decode new token
-        batch.n_tokens = 1;
-        batch.token = &new_token_id; 
-        batch.embd = nullptr;
-        
-        // Restore/Reset pos pointer to valid memory! 
-        // We overrode batch.pos with pos_view.data() previously.
-        // We need to point it back to something. 
-        // Since llama_batch_init allocated memory for pos, but we lost the pointer to it (it's in the struct but we overwrote it).
-        // Wait, `llama_batch` structure: `llama_pos * pos`.
-        // `llama_batch_init` allocates the array and sets `pos` to point to it.
-        // If we overwrote `pos`, we lost the original buffer pointer.
-        // BUT `llama_batch_free` handles freeing. It relies on `batch.token` or `batch.embd`?
-        // Actually `llama_batch_init` does `detail::batch_init`. It creates a single buffer and points distinct pointers into it.
-        // If we lose `pos`, we might cause issues if we try to use it again without setting it validly, BUT `llama_batch_free` frees the `tokens` pointer (which starts the block). 
-        // So memory leak is unlikely if we don't restore, BUT we need a valid pointer to Write to for this decode!
-        
-        llama_pos pos_single = n_past;
-        batch.pos = &pos_single; // Point to stack variable
-        
-        batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = true;
-        
-        if (llama_decode(ctx, batch) != 0) {
-             fprintf(stderr, "failed to decode generated token\n");
-             break;
+
+        // Prepare batch for next token
+        text_batch.n_tokens = 1;
+        text_batch.token[0] = new_token;
+        text_batch.pos[0] = n_past++;
+        text_batch.n_seq_id[0] = 1;
+        text_batch.seq_id[0][0] = 0;
+        text_batch.logits[0] = true;
+
+        if (llama_decode(ctx, text_batch) != 0) {
+            fprintf(stderr, "\nerror: failed to decode generated token\n");
+            break;
         }
-        n_past++;
     }
+
     printf("\n");
 
+    // Cleanup
     llama_sampler_free(smpl);
+    llama_batch_free(text_batch);
     llama_backend_free();
+
     return 0;
 }
