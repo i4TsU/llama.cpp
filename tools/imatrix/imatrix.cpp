@@ -18,8 +18,13 @@
 #include <map>
 #include <regex>
 #include <numeric>
-#include <dirent.h>
-#include <sys/stat.h>
+
+#if defined(_WIN32)
+    #include <windows.h>
+#else
+    #include <dirent.h>
+    #include <sys/stat.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -254,6 +259,33 @@ static bool load_image_embedding(const std::string & path, image_embedding & img
 
 // Load all .embd files from a directory
 static bool load_image_embeddings_from_dir(const std::string & dir_path, std::vector<image_embedding> & embeddings) {
+#if defined(_WIN32)
+    // Windows implementation using FindFirstFile/FindNextFile
+    std::string search_path = dir_path + "\\*.embd";
+    WIN32_FIND_DATAA find_data;
+    HANDLE hFind = FindFirstFileA(search_path.c_str(), &find_data);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        LOG_ERR("%s: failed to open directory '%s'\n", __func__, dir_path.c_str());
+        return false;
+    }
+
+    do {
+        std::string filename = find_data.cFileName;
+        if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".embd") {
+            std::string full_path = dir_path + "\\" + filename;
+            image_embedding img_embd;
+            if (load_image_embedding(full_path, img_embd)) {
+                embeddings.push_back(std::move(img_embd));
+                LOG_INF("%s: loaded %s (%d tokens, %dx%d grid)\n", __func__,
+                        filename.c_str(), img_embd.header.n_tokens, img_embd.header.nx, img_embd.header.ny);
+            }
+        }
+    } while (FindNextFileA(hFind, &find_data) != 0);
+
+    FindClose(hFind);
+#else
+    // POSIX implementation using dirent
     DIR * dir = opendir(dir_path.c_str());
     if (!dir) {
         LOG_ERR("%s: failed to open directory '%s'\n", __func__, dir_path.c_str());
@@ -277,6 +309,7 @@ static bool load_image_embeddings_from_dir(const std::string & dir_path, std::ve
     }
 
     closedir(dir);
+#endif
     return !embeddings.empty();
 }
 
