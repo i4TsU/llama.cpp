@@ -228,12 +228,50 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Loaded %d image tokens (grid=%dx%d, dim=%d, n_pos=%d)\n",
             header.n_tokens, header.nx, header.ny, header.n_embd, header.n_pos);
 
-    // Validate embedding dimensions match the model
-    int model_n_embd = llama_model_n_embd(model);
-    if (header.n_embd != model_n_embd) {
-        fprintf(stderr, "error: embedding dimension mismatch (file: %d, model: %d)\n",
-                header.n_embd, model_n_embd);
-        fprintf(stderr, "hint: the embeddings were generated with a different model\n");
+    // Check embedding dimensions - Qwen3-VL uses deep stack layers where n_embd_inp = n_embd * 4
+    int model_n_embd_inp = llama_model_n_embd_inp(model);
+
+    if (model_n_embd_inp == header.n_embd * 4) {
+        // Apply 2x2 patch merging (pixel shuffle) for Qwen3-VL deep stack
+        fprintf(stderr, "Applying 2x2 patch merging for deep stack layers...\n");
+
+        int new_nx = header.nx / 2;
+        int new_ny = header.ny / 2;
+        int new_n_embd = header.n_embd * 4;
+        std::vector<float> merged(new_nx * new_ny * new_n_embd);
+
+        for (int y = 0; y < new_ny; y++) {
+            for (int x = 0; x < new_nx; x++) {
+                int src_x = x * 2;
+                int src_y = y * 2;
+
+                int dst_idx = (y * new_nx + x) * new_n_embd;
+
+                // Source indices for 2x2 block (TL, TR, BL, BR)
+                int src_tl = (src_y * header.nx + src_x) * header.n_embd;
+                int src_tr = (src_y * header.nx + (src_x + 1)) * header.n_embd;
+                int src_bl = ((src_y + 1) * header.nx + src_x) * header.n_embd;
+                int src_br = ((src_y + 1) * header.nx + (src_x + 1)) * header.n_embd;
+
+                // Concatenate: TL, TR, BL, BR
+                memcpy(merged.data() + dst_idx, embeddings.data() + src_tl, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd, embeddings.data() + src_tr, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd * 2, embeddings.data() + src_bl, header.n_embd * sizeof(float));
+                memcpy(merged.data() + dst_idx + header.n_embd * 3, embeddings.data() + src_br, header.n_embd * sizeof(float));
+            }
+        }
+
+        header.nx = new_nx;
+        header.ny = new_ny;
+        header.n_embd = new_n_embd;
+        header.n_tokens = new_nx * new_ny;
+        embeddings = std::move(merged);
+
+        fprintf(stderr, "Merged to %d tokens (grid=%dx%d, dim=%d)\n",
+                header.n_tokens, header.nx, header.ny, header.n_embd);
+    } else if (header.n_embd != model_n_embd_inp) {
+        fprintf(stderr, "error: embedding dimension mismatch (file: %d, model expects: %d)\n",
+                header.n_embd, model_n_embd_inp);
         llama_backend_free();
         return 1;
     }
