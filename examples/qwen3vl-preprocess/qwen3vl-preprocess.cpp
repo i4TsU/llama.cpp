@@ -42,6 +42,8 @@ static void print_usage(int argc, char ** argv) {
     fprintf(stderr, "  --image FILE          Path to the image file to process\n");
     fprintf(stderr, "\nOptional:\n");
     fprintf(stderr, "  -o, --output FILE     Output file path (default: image.embd)\n");
+    fprintf(stderr, "  --image-min-tokens N  Minimum number of image tokens (default: from model metadata)\n");
+    fprintf(stderr, "  --image-max-tokens N  Maximum number of image tokens (default: from model metadata)\n");
     fprintf(stderr, "\n");
 }
 
@@ -91,6 +93,8 @@ int main(int argc, char ** argv) {
     mtmd_context_params ctx_params = mtmd_context_params_default();
     ctx_params.use_gpu = params.mmproj_use_gpu;
     ctx_params.n_threads = params.cpuparams.n_threads;
+    ctx_params.image_min_tokens = params.image_min_tokens;
+    ctx_params.image_max_tokens = params.image_max_tokens;
 
     mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, ctx_params));
     if (!mctx) {
