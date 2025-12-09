@@ -1,3 +1,10 @@
+// Define NOMINMAX before any Windows headers to prevent min/max macro conflicts
+#if defined(_WIN32)
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+#endif
+
 #include "arg.h"
 #include "common.h"
 #include "log.h"
