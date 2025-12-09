@@ -129,14 +129,16 @@ struct embd_batch {
 };
 
 static void print_usage(int argc, char ** argv) {
-    fprintf(stderr, "\nUsage: %s [options]\n\n", argv[0]);
+    fprintf(stderr, "\nUsage: %s -m MODEL [options]\n\n", argv[0]);
     fprintf(stderr, "Run inference with pre-computed image embeddings.\n\n");
-    fprintf(stderr, "Required options:\n");
-    fprintf(stderr, "  -m, --model FILE      Path to the language model\n");
-    fprintf(stderr, "\nOptional:\n");
-    fprintf(stderr, "  -p, --prompt TEXT     Prompt to use (default: 'Describe this image.')\n");
-    fprintf(stderr, "  -n, --predict N       Number of tokens to predict (default: 512)\n");
-    fprintf(stderr, "\nThe embeddings file 'image.embd' must be in the current directory.\n");
+    fprintf(stderr, "Required:\n");
+    fprintf(stderr, "  -m,  --model FILE      Path to the language model\n");
+    fprintf(stderr, "\nCommon options:\n");
+    fprintf(stderr, "  -p,  --prompt TEXT     Prompt (default: 'Describe this image.')\n");
+    fprintf(stderr, "  -n,  --predict N       Tokens to generate (default: 512)\n");
+    fprintf(stderr, "  -e,  --embd FILE       Embeddings file (default: 'image.embd')\n");
+    fprintf(stderr, "  -ngl N                 GPU layers to offload\n");
+    fprintf(stderr, "  -c N                   Context size\n");
     fprintf(stderr, "\n");
 }
 
@@ -180,6 +182,16 @@ int main(int argc, char ** argv) {
     common_params params;
     params.n_predict = 512;
 
+    std::string embd_file = "image.embd";
+
+    // Parse -e/--embd before common_params_parse (which doesn't know about it)
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if ((arg == "-e" || arg == "--embd") && i + 1 < argc) {
+            embd_file = argv[++i];
+        }
+    }
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
         return 1;
     }
@@ -189,8 +201,6 @@ int main(int argc, char ** argv) {
         print_usage(argc, argv);
         return 1;
     }
-
-    std::string embd_file = "image.embd";
 
     if (params.prompt.empty()) {
         params.prompt = "Describe this image.";
